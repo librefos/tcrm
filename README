@@ -1,0 +1,219 @@
+tcrm
+----
+
+tcrm is a self-hosted CRM and customer-service stack: the Relaticle CRM,
+Chatwoot for support chat, Evolution API for WhatsApp and n8n for
+automations, behind a Traefik reverse proxy.  It runs with Docker
+Compose on one host, over a shared PostgreSQL (with pgvector) where
+every application has its own database and user, plus Redis.  The CRM
+exposes an MCP endpoint, so AI agents can work with its data.
+
+Setup Guide
+----- -----
+This guide outlines the manual steps required to bootstrap the TCRM
+Docker environment from scratch.
+
+Prerequisites
+-------------
+Ensure you have the following installed on your host machine:
+- Docker and Docker Compose
+- openssl (for generating secure keys)
+- htpasswd/apache2-utils (for Traefik dashboard basic auth)
+
+Docker Permissions
+------ -----------
+If this is your first time running Docker on this machine, you may
+encounter a "permission denied while trying to connect to the docker API
+at unix:///var/run/docker.sock" error.
+
+To fix this so you do not have to use `sudo` for every Docker command,
+add your current user to the docker group:
+
+1. Add the user:
+   `sudo usermod -aG docker $USER`
+
+2. Apply the new group:
+   `newgrp docker`
+
+Step 1: Generate Secrets
+---- -- -------- -------
+Before booting the stack, you must generate secure keys and hashes for
+the environment variables.  Run the following commands in your terminal
+and save the outputs:
+
+1. Traefik Dashboard Auth Hash:
+   `htpasswd -nbB <your_admin_username> <your_password>`
+
+2. Relaticle App Key (Base64 32-byte string):
+   `echo "base64:$(openssl rand -base64 32)"`
+
+3. Chatwoot Secret Key (Hex 64-byte string):
+   `openssl rand -hex 64`
+
+4. Evolution API Master Key:
+   `openssl rand -hex 32`
+
+5. n8n Encryption Key (for n8n's credential vault):
+   `openssl rand -base64 32`
+
+Step 2: Environment Configuration
+---- -- ----------- -------------
+1. Copy the template file:
+   `cp .env.example .env`
+
+2. Open `.env` and fill in all the blank variables:
+   - Paste the Traefik hash into DASHBOARD_USERS.
+   - Paste the Relaticle key into RELATICLE_APP_KEY.
+   - Paste the Chatwoot key into CHATWOOT_SECRET_KEY.
+   - Paste the Evolution key into EVOLUTION_API_KEY.
+   - Paste the n8n key into N8N_ENCRYPTION_KEY.
+   - Set secure passwords for POSTGRES_PASSWORD and REDIS_PASSWORD.
+   - Set passwords for all application database users.
+
+Step 3: Local DNS Routing (Optional but recommended)
+---- -- ----- --- ------- --------- --- ------------
+If your system or browser does not automatically resolve `*.localhost`
+to your local machine, you need to map them manually.
+
+1. Open your hosts file (requires root):
+   `sudo ed /etc/hosts`
+
+2. Add the following line:
+   `127.0.0.1  dashboard.localhost crm.localhost chat.localhost evolution.localhost n8n.localhost`
+
+Step 4: First-time Provisioning
+---- -- ---------- ------------
+Because of dependency requirements and strict database security, you
+cannot boot the entire stack blindly the very first time.  Chatwoot
+requires its database to be manually prepared and relies on several
+PostgreSQL extensions that its restricted user cannot create.
+
+1. Boot ONLY the Tier 1 database layer first to allow Postgres to
+   initialize the schemas:
+   `docker compose up -d postgres redis`
+
+2. Wait 60 to 120 seconds.  Verify Postgres is ready:
+   `docker compose ps`
+   (Wait until the postgres container shows as "healthy").
+
+3. Inject required database extensions:
+   By default, the chatwoot database user is restricted.  You must log
+   in as the Postgres superuser to install all 5 extensions Chatwoot
+   needs.  Run this exact command:
+   `docker exec -i tcrm-postgres-1 psql -U postgres -d chatwoot_db -f -
+    <<'SQL'
+     CREATE EXTENSION IF NOT EXISTS pgcrypto;
+     CREATE EXTENSION IF NOT EXISTS pg_trgm;
+     CREATE EXTENSION IF NOT EXISTS btree_gin;
+     CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+     CREATE EXTENSION IF NOT EXISTS vector;
+   SQL`
+
+4. Prepare the chatwoot database:
+   Run the one-off database preparation command.  This will create the
+   tables and seed the initial data:
+   `docker compose run --rm chatwoot bundle exec rake db:chatwoot_prepare`
+
+Step 5: Boot The Full Stack
+---- -- ---- --- ---- -----
+Once the Chatwoot migration finishes successfully, you can bring up the
+rest of the proxy and application layer:
+
+1. Boot everything in the background:
+   `docker compose up -d`
+
+2. Verify all services report as "Up" and "healthy":
+   `docker compose ps`
+
+Unlike Chatwoot, Evolution API and n8n handle their own database
+migrations on startup.  Evolution API takes about 15-30 seconds to run
+its Prisma migrations.  You can check its progress by running:
+   `docker compose logs --tail=50 evolution`
+   (Wait until you see "HTTP - ON: 8080").
+
+Step 6: Initial Configuration & MCP Verification
+---- -- ------- ------------- - --- ------------
+Once the entire stack is online, you must create your master CRM account
+and verify the AI integration endpoint.
+
+1. Create the Master Account:
+   Open your browser and navigate to http://crm.localhost
+   Click "Log In" or "Get Started" to access the registration page.
+   The first user created in a fresh database is automatically granted
+   Superadmin privileges and creates the default Workspace.
+
+2. Generate an AI API Token:
+   Inside the Relaticle dashboard, click your user profile.
+   Navigate to the API Tokens/Personal Access Tokens section.
+   Create a new token (e.g., "MCP Testing") and grant it ALL permissions
+   (Create, Read, Update, Delete).
+   Copy the generated token immediately.  It will not be shown again.
+
+3. Verify the MCP (Model Context Protocol) Endpoint:
+   The MCP server requires a strict JSON-RPC POST request to communicate.
+   Run this command in your terminal to ask the CRM for a list of tools,
+   replacing <YOUR_TOKEN_HERE> with your copied token:
+
+   curl -i -X POST \
+     -H "Accept: application/json" \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer <YOUR_TOKEN_HERE>" \
+     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}' \
+     http://crm.localhost/mcp
+
+   If successful, you will receive an `HTTP/1.1 200 OK` response
+   containing a JSON array of all available CRM tools (e.g.,
+   create_company, list_people, etc.).  The MCP endpoint is then ready
+   for AI agents.
+
+Accessing The Application
+--------- --- -----------
+Traefik Dashboard : http://dashboard.localhost (Uses htpasswd credentials)
+Relaticle CRM     : http://crm.localhost
+Chatwoot          : http://chat.localhost
+Evolution API     : http://evolution.localhost
+N8N               : http://n8n.localhost
+
+PostgreSQL and Redis are published on 127.0.0.1 only, for local
+administration.  The applications reach them over the internal Docker
+network.
+
+To shut down the environment safely without losing data:
+`docker compose down`
+
+To completely wipe the environment AND all database data:
+`docker compose down -v`
+
+DO NOT use the `-v` flag unless your explicit goal is to completely
+destroy the environment.  If you run this command, you will instantly
+lose all Relaticle configurations, all Chatwoot messages, the underlying
+database schemas, and the custom PostgreSQL extensions.
+
+If you accidentally run this, you must repeat Step 4 to rebuild the
+databases from scratch.
+
+References
+----------
+https://github.com/docker/compose
+https://github.com/traefik/traefik
+https://www.postgresql.org/docs/
+https://redis.io/docs/latest/
+https://relaticle.com/docs
+https://developers.chatwoot.com/introduction
+
+License
+-------
+Copyright (C) 2026  Thiago C. Silva <librefos@newliber.com>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
